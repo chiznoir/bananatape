@@ -39,7 +39,7 @@ export function ToolPalette() {
   };
 
   return (
-    <div className="flex max-w-full items-center gap-1 overflow-x-auto">
+    <div className="flex min-w-0 max-w-full items-center gap-1 overflow-x-auto overflow-y-hidden [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
       {tools.map((tool) => {
         const Icon = tool.icon;
         const isActive = activeTool === tool.id;

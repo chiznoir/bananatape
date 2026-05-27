@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { EyeOff, Loader2, RefreshCw, Wand2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { CanvasContextMenu } from './CanvasContextMenu';
@@ -148,12 +148,23 @@ function ScopedMemoOverlay({ image, isFocused }: { image: CanvasImage; isFocused
 }
 
 
+function magicLayerArea(layer: MagicLayer): number {
+  return layer.sourceBounds.width * layer.sourceBounds.height;
+}
+
+function orderMagicLayersForHitTesting(layers: MagicLayer[]): MagicLayer[] {
+  // Later DOM nodes receive pointer events first. Render broad regions first and
+  // the smallest precise targets last so OCR words/icons beat containing layout
+  // groups when boxes overlap.
+  return [...layers].sort((a, b) => magicLayerArea(b) - magicLayerArea(a));
+}
+
 function MagicLayerOverlay({ image, enabled }: { image: CanvasImage; enabled: boolean }) {
   const [draggingLayerId, setDraggingLayerId] = useState<string | null>(null);
   const [livePositions, setLivePositions] = useState<Record<string, { x: number; y: number }>>({});
   const livePositionsRef = useRef<Record<string, { x: number; y: number }>>({});
   const dragStartRef = useRef<{ layerId: string; pointerId: number; clientX: number; clientY: number; startX: number; startY: number } | null>(null);
-  const layers = image.magicLayers ?? [];
+  const hitTestLayers = useMemo(() => orderMagicLayersForHitTesting(image.magicLayers ?? []), [image.magicLayers]);
 
   const { apply } = useMagicLayerApply();
   const [isApplying, setIsApplying] = useState(false);
@@ -228,11 +239,11 @@ function MagicLayerOverlay({ image, enabled }: { image: CanvasImage; enabled: bo
     setLivePositions(nextLivePositions);
   }, [image.id]);
 
-  if (layers.length === 0) return null;
+  if (hitTestLayers.length === 0) return null;
 
   return (
     <div className="absolute inset-0" data-testid="magic-layer-overlay" style={{ pointerEvents: enabled ? 'auto' : 'none' }}>
-      {layers.map((layer) => {
+      {hitTestLayers.map((layer) => {
         if (layer.hidden) return null;
         const isSelected = image.selectedMagicLayerId === layer.id;
         const position = livePositions[layer.id] ?? layer.position;

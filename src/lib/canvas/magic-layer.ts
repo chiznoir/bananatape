@@ -79,6 +79,23 @@ function drawMaskCrop(
   }
 }
 
+function expandMaskAlpha(mask: HTMLCanvasElement, radius: number): HTMLCanvasElement {
+  if (radius <= 0) return mask;
+  const canvas = document.createElement('canvas');
+  canvas.width = mask.width;
+  canvas.height = mask.height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return mask;
+
+  for (let dy = -radius; dy <= radius; dy += 1) {
+    for (let dx = -radius; dx <= radius; dx += 1) {
+      if ((dx * dx) + (dy * dy) > radius * radius) continue;
+      ctx.drawImage(mask, dx, dy);
+    }
+  }
+  return canvas;
+}
+
 async function cropCutout(
   base: HTMLImageElement,
   mask: HTMLCanvasElement,
@@ -98,25 +115,61 @@ async function cropCutout(
   return canvas.toDataURL('image/png');
 }
 
+function sampleFillColor(
+  ctx: CanvasRenderingContext2D,
+  bounds: { x: number; y: number; width: number; height: number },
+  imageSize: { width: number; height: number },
+): [number, number, number] {
+  const samples: Array<[number, number, number]> = [];
+  const left = Math.max(0, bounds.x - 3);
+  const right = Math.min(imageSize.width - 1, bounds.x + bounds.width + 2);
+  const top = Math.max(0, bounds.y - 3);
+  const bottom = Math.min(imageSize.height - 1, bounds.y + bounds.height + 2);
+  const step = Math.max(1, Math.floor(Math.min(bounds.width, bounds.height) / 12));
+
+  const pushSample = (x: number, y: number) => {
+    const pixel = ctx.getImageData(x, y, 1, 1).data;
+    if (pixel[3] === 0) return;
+    samples.push([pixel[0], pixel[1], pixel[2]]);
+  };
+
+  for (let x = bounds.x; x < bounds.x + bounds.width; x += step) {
+    pushSample(Math.max(0, Math.min(imageSize.width - 1, x)), top);
+    pushSample(Math.max(0, Math.min(imageSize.width - 1, x)), bottom);
+  }
+  for (let y = bounds.y; y < bounds.y + bounds.height; y += step) {
+    pushSample(left, Math.max(0, Math.min(imageSize.height - 1, y)));
+    pushSample(right, Math.max(0, Math.min(imageSize.height - 1, y)));
+  }
+
+  if (samples.length === 0) {
+    const sampleX = Math.max(0, Math.min(imageSize.width - 1, bounds.x - 1));
+    const sampleY = Math.max(0, Math.min(imageSize.height - 1, bounds.y + Math.floor(bounds.height / 2)));
+    const pixel = ctx.getImageData(sampleX, sampleY, 1, 1).data;
+    return [pixel[0], pixel[1], pixel[2]];
+  }
+
+  const [r, g, b] = samples.reduce<[number, number, number]>((acc, sample) => [acc[0] + sample[0], acc[1] + sample[1], acc[2] + sample[2]], [0, 0, 0]);
+  return [Math.round(r / samples.length), Math.round(g / samples.length), Math.round(b / samples.length)];
+}
+
 function fillRemovedRegion(
   ctx: CanvasRenderingContext2D,
   mask: HTMLCanvasElement,
   bounds: { x: number; y: number; width: number; height: number },
   imageSize: { width: number; height: number },
 ) {
-  const sampleX = Math.max(0, Math.min(imageSize.width - 1, bounds.x - 1));
-  const sampleY = Math.max(0, Math.min(imageSize.height - 1, bounds.y + Math.floor(bounds.height / 2)));
-  const pixel = ctx.getImageData(sampleX, sampleY, 1, 1).data;
-
+  const removalMask = expandMaskAlpha(mask, 2);
+  const [r, g, b] = sampleFillColor(ctx, bounds, imageSize);
   const patch = document.createElement('canvas');
   patch.width = bounds.width;
   patch.height = bounds.height;
   const patchCtx = patch.getContext('2d');
   if (!patchCtx) return;
-  patchCtx.fillStyle = `rgb(${pixel[0]} ${pixel[1]} ${pixel[2]})`;
+  patchCtx.fillStyle = `rgb(${r} ${g} ${b})`;
   patchCtx.fillRect(0, 0, bounds.width, bounds.height);
   patchCtx.globalCompositeOperation = 'destination-in';
-  drawMaskCrop(patchCtx, mask, bounds, imageSize);
+  drawMaskCrop(patchCtx, removalMask, bounds, imageSize);
   patchCtx.globalCompositeOperation = 'source-over';
 
   ctx.drawImage(patch, bounds.x, bounds.y);

@@ -16,6 +16,23 @@ import { LeftPanel } from './Sidebar/LeftPanel';
 import { TopBar } from './Shell/TopBar';
 import { ToastContainer } from './ToastContainer';
 
+type LoadedImageSize = { width: number; height: number };
+
+function loadImageSize(url: string): Promise<LoadedImageSize> {
+  return new Promise((resolve, reject) => {
+    const image = new Image();
+    image.onload = () => {
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        resolve({ width: image.naturalWidth, height: image.naturalHeight });
+        return;
+      }
+      reject(new Error('Loaded project image has no readable dimensions'));
+    };
+    image.onerror = () => reject(new Error('Project image dimensions could not be loaded'));
+    image.src = url;
+  });
+}
+
 export function EditorLayout() {
   return (
     <PromptComposerProvider>
@@ -27,7 +44,7 @@ export function EditorLayout() {
 function StandaloneEditorShell() {
   useKeyboardShortcuts();
 
-  const { toasts, removeToast } = useToast();
+  const { toasts, addToast, removeToast } = useToast();
   const baseImage = useEditorStore((s) => s.baseImage);
   const setBaseImage = useEditorStore((s) => s.setBaseImage);
   const canvasImageCount = useCanvasStore((s) => s.imageOrder.length);
@@ -42,14 +59,20 @@ function StandaloneEditorShell() {
     async function hydrateProjectHistory() {
       try {
         const sessionRes = await fetch('/api/projects/current', { cache: 'no-store' });
-        if (!sessionRes.ok) return;
+        if (!sessionRes.ok) {
+          const payload = await sessionRes.json().catch(() => null) as { error?: string } | null;
+          throw new Error(payload?.error || 'Project session could not be loaded');
+        }
         const session = await sessionRes.json();
         if (session.persistence !== 'project') return;
         if (typeof session.projectName === 'string' && session.projectName.trim()) {
           setProjectName(session.projectName);
         }
         const historyRes = await fetch('/api/projects/history', { cache: 'no-store' });
-        if (!historyRes.ok) return;
+        if (!historyRes.ok) {
+          const payload = await historyRes.json().catch(() => null) as { error?: string } | null;
+          throw new Error(payload?.error || 'Project history could not be loaded');
+        }
         const history = await historyRes.json();
         if (cancelled || !Array.isArray(history.entries)) return;
         const first = history.entries[0];
@@ -61,13 +84,15 @@ function StandaloneEditorShell() {
         }));
         hydrateEntries(entries);
         if (first?.assetUrl) {
-          setBaseImage(first.assetUrl, { width: 0, height: 0 });
+          const imageSize = await loadImageSize(first.assetUrl);
+          if (cancelled) return;
+          setBaseImage(first.assetUrl, imageSize);
           if (rootImageId && canvasImageCount === 0) {
             const rootImage: CanvasImage = {
               id: rootImageId,
               url: first.assetUrl,
               assetId: typeof first.assetId === 'string' ? first.assetId : undefined,
-              size: { width: 1024, height: 1024 },
+              size: imageSize,
               position: { x: 0, y: 0 },
               parentId: null,
               generationIndex: 0,
@@ -83,13 +108,16 @@ function StandaloneEditorShell() {
             hydrateCanvas({ [rootImageId]: rootImage }, [rootImageId], [rootImageId]);
           }
         }
-      } catch {
-        // No active local project; keep no-project fallback behavior.
+      } catch (error) {
+        if (!cancelled) {
+          const message = error instanceof Error ? error.message : 'Project history could not be loaded';
+          addToast(message, 'error', { durationMs: 8000 });
+        }
       }
     }
     void hydrateProjectHistory();
     return () => { cancelled = true; };
-  }, [canvasImageCount, hydrateCanvas, hydrateEntries, setBaseImage]);
+  }, [addToast, canvasImageCount, hydrateCanvas, hydrateEntries, setBaseImage]);
 
   useEffect(() => {
     if (!baseImage || canvasImageCount > 0) return;

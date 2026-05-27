@@ -130,6 +130,24 @@ export BANANATAPE_SAM3_COMMAND="python3 /path/to/bananatape/scripts/sam3-magic-l
 bananatape launch logo-explorations
 ```
 
+The wrapper uses Tesseract for optional OCR text boxes by default. Install
+Tesseract and the language packs on the host or in the same external SAM 3
+runtime environment:
+
+```bash
+sudo apt-get install tesseract-ocr tesseract-ocr-kor tesseract-ocr-eng
+export BANANATAPE_SAM3_COMMAND="python3 /path/to/bananatape/scripts/sam3-magic-layer.py --ocr-provider tesseract --ocr-lang kor+eng --input {input} --output {output}"
+```
+
+For text-heavy Korean slides that need stronger scene-text detection, install
+PaddleOCR into the same external SAM 3 Python environment and opt in explicitly:
+
+```bash
+python -m pip install paddlepaddle -i https://www.paddlepaddle.org.cn/packages/stable/cpu/
+python -m pip install paddleocr
+export BANANATAPE_SAM3_COMMAND="python3 /path/to/bananatape/scripts/sam3-magic-layer.py --ocr-provider paddle --paddle-lang korean --input {input} --output {output}"
+```
+
 **Custom backend**
 
 `BANANATAPE_SAM3_COMMAND` accepts any command that takes `--input <image>` `--output <json>` and writes:

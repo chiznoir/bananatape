@@ -172,6 +172,31 @@ describe('MagicLayerOverlay Apply button', () => {
     unmount();
   });
 
+  it('renders smaller overlapping magic layers after larger regions so they win hit testing', () => {
+    useEditorStore.getState().setActiveTool('magic-layer');
+    const smallText = makeLayer({
+      id: 'paddle-ocr-text',
+      name: 'text: 역할',
+      sourceBounds: { x: 100, y: 100, width: 80, height: 30 },
+      position: { x: 100, y: 100 },
+    });
+    const largeLayout = makeLayer({
+      id: 'layout-group',
+      name: 'layout group',
+      sourceBounds: { x: 80, y: 80, width: 400, height: 220 },
+      position: { x: 80, y: 80 },
+    });
+    const image = makeImage({ magicLayers: [smallText, largeLayout] });
+    const { host, unmount } = renderItem(image, true);
+
+    const renderedIds = Array.from(host.querySelectorAll('[data-testid="magic-layer-item"]'))
+      .map((node) => node.getAttribute('data-magic-layer-id'));
+
+    expect(renderedIds).toEqual(['layout-group', 'paddle-ocr-text']);
+
+    unmount();
+  });
+
   it('calls apply with the image id when the enabled button is clicked', async () => {
     useEditorStore.getState().setActiveTool('magic-layer');
     const image = makeImage();

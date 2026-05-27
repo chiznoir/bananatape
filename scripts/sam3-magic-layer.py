@@ -19,9 +19,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import csv
 import io
 import json
+import subprocess
 import sys
+import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Iterable
 
@@ -46,13 +50,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--layout-detail-segments", type=int, default=24, help="Maximum fine no-dependency layout/color components to add for slide-like images.")
     parser.add_argument("--layout-color-segments", type=int, default=24, help="Maximum color-separated layout components to add for slide-like images.")
     parser.add_argument("--layout-distance-threshold", type=float, default=42.0, help="RGB distance from border-estimated background for layout component extraction.")
+    parser.add_argument("--ocr-provider", choices=("none", "tesseract", "paddle"), default="tesseract", help="Optional OCR provider for text-heavy Magic Layer boxes.")
+    parser.add_argument("--ocr-segments", type=int, default=16, help="Maximum optional OCR text boxes to add for text-heavy images.")
+    parser.add_argument("--ocr-max-layout-segments", type=int, default=6, help="When OCR is enabled, cap retained layout/group boxes so text boxes do not compete with many coarse duplicates. Use a negative value to disable this cap.")
+    parser.add_argument("--ocr-min-confidence", type=float, default=70.0, help="Minimum OCR confidence for OCR text boxes.")
+    parser.add_argument("--ocr-lang", default="kor+eng", help="Tesseract language pack for optional OCR text boxes.")
+    parser.add_argument("--paddle-lang", default="korean", help="PaddleOCR language code for optional OCR text boxes.")
+    parser.add_argument("--paddle-engine", choices=("paddle", "transformers"), default="paddle", help="PaddleOCR 3.x inference engine for optional OCR text boxes.")
     return parser.parse_args()
 
 
 def to_numpy(value):
     import numpy as np
 
-    return value.detach().cpu().numpy() if hasattr(value, "detach") else np.asarray(value)
+    if hasattr(value, "detach"):
+        tensor = value.detach()
+        # NumPy cannot directly materialize torch.bfloat16 tensors. Convert
+        # floating outputs to float32 before moving them to CPU/NumPy for JSON
+        # serialization and mask post-processing.
+        if getattr(tensor, "is_floating_point", lambda: False)():
+            tensor = tensor.float()
+        return tensor.cpu().numpy()
+    return np.asarray(value)
 
 
 def data_url_from_mask(mask) -> str:
@@ -115,6 +134,16 @@ def area_ratio(box: dict[str, float], image_size: tuple[int, int]) -> float:
     return (box["width"] * box["height"]) / max(1.0, float(target_w * target_h))
 
 
+def prompt_min_area_ratio(prompt: str, default_min_area_ratio: float) -> float:
+    # SAM 3's "line" prompt tends to return many decorative strokes and page
+    # footer glyphs on slide/card layouts. Keep only line-sized edit targets
+    # large enough to be useful, while allowing small icons/symbols through the
+    # global threshold.
+    if prompt.strip().lower() == "line":
+        return max(default_min_area_ratio, 0.0015)
+    return default_min_area_ratio
+
+
 def iou(a: dict[str, float], b: dict[str, float]) -> float:
     ax2 = a["x"] + a["width"]
     ay2 = a["y"] + a["height"]
@@ -151,6 +180,46 @@ def containment_ratio(child: dict[str, float], parent: dict[str, float]) -> floa
     return intersection_area(child, parent) / max(box_area(child), 1e-6)
 
 
+def normalized_ocr_text(segment: dict) -> str:
+    label = str(segment.get("label", ""))
+    if label.startswith("text:"):
+        label = label[5:]
+    return "".join(label.lower().split())
+
+
+def prune_contained_ocr_segments(segments: list[dict], containment_threshold: float = 0.82) -> list[dict]:
+    # OCR engines can emit nested text candidates for the same visual text:
+    # word, phrase, sentence, and paragraph boxes. For direct manipulation, keep
+    # the smallest selectable text units and drop larger boxes that mostly just
+    # contain already-detected OCR units.
+    ordered = sorted(segments, key=lambda segment: box_area(segment["bbox"]))
+    kept: list[dict] = []
+    for segment in ordered:
+        box = segment["bbox"]
+        text = normalized_ocr_text(segment)
+        contained_smaller = [
+            existing
+            for existing in kept
+            if containment_ratio(existing["bbox"], box) >= containment_threshold
+        ]
+        if len(contained_smaller) >= 2:
+            continue
+        if contained_smaller:
+            smaller_text = normalized_ocr_text(contained_smaller[0])
+            if smaller_text and text and (smaller_text in text or text in smaller_text):
+                continue
+        kept.append(segment)
+    return kept
+
+
+def sort_ocr_segments_for_selection(segments: list[dict]) -> list[dict]:
+    return sorted(
+        segments,
+        key=lambda item: (float(item.get("score", 0)), -box_area(item["bbox"])),
+        reverse=True,
+    )
+
+
 def suppress_nested_sam_parts(segments: list[dict]) -> list[dict]:
     kept: list[dict] = []
     for child in segments:
@@ -175,6 +244,46 @@ def suppress_nested_sam_parts(segments: list[dict]) -> list[dict]:
             break
         if not suppress:
             kept.append(child)
+    return kept
+
+
+def suppress_text_like_layouts_when_ocr_exists(segments: list[dict], image_size: tuple[int, int]) -> list[dict]:
+    ocr_segments = [segment for segment in segments if segment.get("source") in {"ocr", "paddle-ocr"}]
+    if not ocr_segments:
+        return segments
+
+    _image_w, image_h = image_size
+    kept: list[dict] = []
+    for segment in segments:
+        if segment.get("source") != "layout":
+            kept.append(segment)
+            continue
+        box = segment["bbox"]
+        # Text-like layout components are usually narrow bands around headings,
+        # phrases, or chip rows. When OCR already exposes the smaller text units,
+        # these layout bands mostly add duplicate click targets.
+        if area_ratio(box, image_size) > 0.08 or (box["height"] / max(float(image_h), 1.0)) > 0.16:
+            kept.append(segment)
+            continue
+        if any(containment_ratio(ocr["bbox"], box) >= 0.75 for ocr in ocr_segments):
+            continue
+        kept.append(segment)
+    return kept
+
+
+def cap_layout_segments_when_ocr_exists(segments: list[dict], max_layout_segments: int) -> list[dict]:
+    if max_layout_segments < 0:
+        return segments
+    if not any(segment.get("source") in {"ocr", "paddle-ocr"} for segment in segments):
+        return segments
+    kept: list[dict] = []
+    layout_count = 0
+    for segment in segments:
+        if segment.get("source") == "layout":
+            if layout_count >= max_layout_segments:
+                continue
+            layout_count += 1
+        kept.append(segment)
     return kept
 
 
@@ -422,6 +531,241 @@ def iter_layout_segments(
         emitted.add(key)
         yield segment
 
+
+def iter_ocr_text_segments(input_path: Path, image_size: tuple[int, int], max_segments: int, min_confidence: float, lang: str, min_area_ratio: float) -> Iterable[dict]:
+    if max_segments <= 0:
+        return
+
+    target_w, target_h = image_size
+    try:
+        with tempfile.TemporaryDirectory(prefix="bananatape-ocr-") as tmp:
+            output_base = Path(tmp) / "ocr"
+            subprocess.run(
+                ["tesseract", str(input_path), str(output_base), "-l", lang, "--psm", "6", "tsv"],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            tsv_path = output_base.with_suffix(".tsv")
+            with tsv_path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle, delimiter="\t"))
+    except (FileNotFoundError, subprocess.SubprocessError, OSError, UnicodeDecodeError):
+        return
+
+    candidates: list[dict] = []
+    for row in rows:
+        text = (row.get("text") or "").strip()
+        if not text:
+            continue
+        try:
+            confidence = float(row.get("conf", "-1"))
+            x = int(float(row.get("left", "0")))
+            y = int(float(row.get("top", "0")))
+            width = int(float(row.get("width", "0")))
+            height = int(float(row.get("height", "0")))
+        except ValueError:
+            continue
+        if confidence < min_confidence or width < 12 or height < 12:
+            continue
+        pad = max(3, min(10, round(height * 0.12)))
+        x1 = max(0, x - pad)
+        y1 = max(0, y - pad)
+        x2 = min(target_w, x + width + pad)
+        y2 = min(target_h, y + height + pad)
+        bbox = {"x": float(x1), "y": float(y1), "width": float(max(1, x2 - x1)), "height": float(max(1, y2 - y1))}
+        ratio = area_ratio(bbox, image_size)
+        if ratio < min_area_ratio or ratio > 0.18:
+            continue
+        candidates.append({
+            "id": f"ocr-word-{len(candidates) + 1}",
+            "label": f"text: {text}",
+            "score": max(0.0, min(1.0, confidence / 100.0)),
+            "source": "ocr",
+            "bbox": bbox,
+        })
+
+    candidates = sort_ocr_segments_for_selection(prune_contained_ocr_segments(candidates))
+    for segment in candidates[:max_segments]:
+        yield segment
+
+
+def instantiate_paddle_ocr(lang: str, engine: str):
+    try:
+        from paddleocr import PaddleOCR
+    except Exception as exc:
+        raise RuntimeError(f"PaddleOCR dependencies are not available: {exc}") from exc
+
+    init_attempts = [
+        {
+            "lang": lang,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+            "engine": engine,
+        },
+        {
+            "lang": lang,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        },
+        {
+            "lang": lang,
+            "use_angle_cls": False,
+            "show_log": False,
+        },
+        {
+            "lang": lang,
+            "use_angle_cls": False,
+        },
+    ]
+    errors: list[str] = []
+    for kwargs in init_attempts:
+        try:
+            return PaddleOCR(**kwargs)
+        except TypeError as exc:
+            errors.append(str(exc))
+            continue
+    raise RuntimeError(f"PaddleOCR initialization failed: {' | '.join(errors)}")
+
+
+def result_mapping(result) -> dict:
+    if isinstance(result, dict):
+        inner = result.get("res")
+        return inner if isinstance(inner, dict) else result
+    try:
+        mapped = dict(result)
+        inner = mapped.get("res")
+        return inner if isinstance(inner, dict) else mapped
+    except Exception:
+        return {}
+
+
+def polygon_bbox(poly, image_size: tuple[int, int]) -> dict[str, float] | None:
+    import numpy as np
+
+    target_w, target_h = image_size
+    arr = np.asarray(poly, dtype=float).reshape(-1, 2)
+    if arr.size == 0:
+        return None
+    x1 = max(0, int(np.floor(arr[:, 0].min())))
+    y1 = max(0, int(np.floor(arr[:, 1].min())))
+    x2 = min(target_w, int(np.ceil(arr[:, 0].max())))
+    y2 = min(target_h, int(np.ceil(arr[:, 1].max())))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return {"x": float(x1), "y": float(y1), "width": float(max(1, x2 - x1)), "height": float(max(1, y2 - y1))}
+
+
+def iter_paddle_v3_segments(results, image_size: tuple[int, int], min_score: float) -> Iterable[dict]:
+    for result in results or []:
+        mapped = result_mapping(result)
+        polys = mapped.get("rec_polys")
+        if polys is None:
+            polys = mapped.get("dt_polys")
+        boxes = mapped.get("rec_boxes")
+        texts = list(mapped.get("rec_texts") or [])
+        scores = list(mapped.get("rec_scores") or mapped.get("dt_scores") or [])
+        if polys is None and boxes is None:
+            continue
+
+        regions = list(polys if polys is not None else boxes)
+        for index, region in enumerate(regions):
+            score = float(scores[index]) if index < len(scores) else 1.0
+            text = str(texts[index]).strip() if index < len(texts) else ""
+            if score < min_score:
+                continue
+            bbox = polygon_bbox(region, image_size)
+            if bbox is None:
+                continue
+            yield {
+                "label": f"text: {text}" if text else "text",
+                "score": max(0.0, min(1.0, score)),
+                "source": "paddle-ocr",
+                "bbox": bbox,
+            }
+
+
+def is_legacy_paddle_row(value) -> bool:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return False
+    box, rec = value
+    if not isinstance(box, (list, tuple)) or not box:
+        return False
+    if not isinstance(rec, (list, tuple)) or len(rec) < 2:
+        return False
+    return isinstance(rec[0], str)
+
+
+def iter_legacy_paddle_rows(value) -> Iterable[tuple[object, str, float]]:
+    if is_legacy_paddle_row(value):
+        box, rec = value
+        try:
+            yield box, str(rec[0]), float(rec[1])
+        except (TypeError, ValueError):
+            return
+        return
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            yield from iter_legacy_paddle_rows(item)
+
+
+def iter_paddle_legacy_segments(results, image_size: tuple[int, int], min_score: float) -> Iterable[dict]:
+    for box, text, score in iter_legacy_paddle_rows(results):
+        if score < min_score:
+            continue
+        bbox = polygon_bbox(box, image_size)
+        if bbox is None:
+            continue
+        yield {
+            "label": f"text: {text.strip()}" if text.strip() else "text",
+            "score": max(0.0, min(1.0, score)),
+            "source": "paddle-ocr",
+            "bbox": bbox,
+        }
+
+
+def iter_paddle_text_segments(
+    input_path: Path,
+    image_size: tuple[int, int],
+    max_segments: int,
+    min_confidence: float,
+    lang: str,
+    engine: str,
+    min_area_ratio: float,
+) -> Iterable[dict]:
+    if max_segments <= 0:
+        return
+
+    min_score = max(0.0, min(1.0, min_confidence / 100.0))
+    ocr = instantiate_paddle_ocr(lang, engine)
+    try:
+        if hasattr(ocr, "predict"):
+            raw_results = ocr.predict(str(input_path))
+            candidates = list(iter_paddle_v3_segments(raw_results, image_size, min_score))
+        else:
+            raw_results = ocr.ocr(str(input_path), cls=False)
+            candidates = list(iter_paddle_legacy_segments(raw_results, image_size, min_score))
+    except Exception as exc:
+        raise RuntimeError(f"PaddleOCR failed: {exc}") from exc
+
+    filtered: list[dict] = []
+    for index, segment in enumerate(candidates):
+        bbox = segment["bbox"]
+        ratio = area_ratio(bbox, image_size)
+        if ratio < min_area_ratio or ratio > 0.18:
+            continue
+        filtered.append({
+            **segment,
+            "id": f"paddle-ocr-{index + 1}",
+        })
+
+    filtered = sort_ocr_segments_for_selection(prune_contained_ocr_segments(filtered))
+    for segment in filtered[:max_segments]:
+        yield segment
+
+
 def iter_prompt_segments(processor, state, prompt: str, threshold: float, image_size: tuple[int, int], min_area_ratio: float, max_area_ratio: float) -> Iterable[dict]:
     output = processor.set_text_prompt(state=state, prompt=prompt)
     masks = output.get("masks", [])
@@ -434,7 +778,8 @@ def iter_prompt_segments(processor, state, prompt: str, threshold: float, image_
             continue
         bbox = mask_bbox(mask, box)
         ratio = area_ratio(bbox, image_size)
-        if ratio < min_area_ratio or ratio > max_area_ratio:
+        prompt_min_area = prompt_min_area_ratio(prompt, min_area_ratio)
+        if ratio < prompt_min_area or ratio > max_area_ratio:
             continue
         yield {
             "id": f"{prompt.replace(' ', '-')}-{index + 1}",
@@ -455,6 +800,7 @@ def main() -> int:
         return 2
 
     try:
+        import torch
         from PIL import Image
         from sam3.model_builder import build_sam3_image_model
         from sam3.model.sam3_image_processor import Sam3Processor
@@ -465,19 +811,37 @@ def main() -> int:
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
     image = Image.open(input_path).convert("RGB")
-    state = processor.set_image(image)
+
+    # SAM 3's CUDA image path expects bf16 autocast around inference on recent
+    # NVIDIA/PyTorch stacks. Without this, the ViT forward can mix BFloat16
+    # activations with Float32 weights and fail with a dtype mismatch.
+    inference_context = (
+        torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        if torch.cuda.is_available()
+        else nullcontext()
+    )
+
+    with inference_context:
+        state = processor.set_image(image)
 
     candidates: list[dict] = []
     prompts = [prompt.strip() for prompt in args.prompts.split(",") if prompt.strip()]
     image_size = image.size
-    for prompt in prompts:
-        for segment in iter_prompt_segments(processor, state, prompt, args.score_threshold, image_size, args.min_area_ratio, args.max_area_ratio):
-            candidates.append(segment)
+    with inference_context:
+        for prompt in prompts:
+            for segment in iter_prompt_segments(processor, state, prompt, args.score_threshold, image_size, args.min_area_ratio, args.max_area_ratio):
+                candidates.append(segment)
 
     if args.layout_segments > 0:
         candidates.extend(iter_layout_segments(image, image_size, args.layout_segments, args.layout_detail_segments, args.layout_color_segments, args.layout_distance_threshold, args.min_area_ratio, args.max_area_ratio))
+    if args.ocr_segments > 0 and args.ocr_provider == "tesseract":
+        candidates.extend(iter_ocr_text_segments(input_path, image_size, args.ocr_segments, args.ocr_min_confidence, args.ocr_lang, args.min_area_ratio))
+    if args.ocr_segments > 0 and args.ocr_provider == "paddle":
+        candidates.extend(iter_paddle_text_segments(input_path, image_size, args.ocr_segments, args.ocr_min_confidence, args.paddle_lang, args.paddle_engine, args.min_area_ratio))
 
+    candidates = suppress_text_like_layouts_when_ocr_exists(candidates, image_size)
     segments = dedupe_segments(candidates, args.nms_iou, args.max_segments)
+    segments = cap_layout_segments_when_ocr_exists(segments, args.ocr_max_layout_segments)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps({"segments": segments}, ensure_ascii=False, indent=2), encoding="utf-8")
